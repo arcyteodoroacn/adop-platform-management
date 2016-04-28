@@ -15,9 +15,9 @@ def generateProjectJob = freeStyleJob(projectManagementFolderName + "/Generate_P
 generateProjectJob.with{
     parameters{
         stringParam("PROJECT_NAME","","The name of the project to be generated.")
-        stringParam("ADMIN_USERS","","The list of users' email addresses that should be setup initially as admin. They will have full access to all jobs within the project.")
-        stringParam("DEVELOPER_USERS","","The list of users' email addresses that should be setup initially as developers. They will have full access to all non-admin jobs within the project.")
-        stringParam("VIEWER_USERS","","The list of users' email addresses that should be setup initially as viewers. They will have read-only access to all non-admin jobs within the project.")
+        stringParam("ADMIN_USERS","gitlabuser@accenture.com","The list of users' email addresses that should be setup initially as admin. They will have full access to all jobs within the project.")
+        stringParam("DEVELOPER_USERS","gitlabuser@accenture.com","The list of users' email addresses that should be setup initially as developers. They will have full access to all non-admin jobs within the project.")
+        stringParam("VIEWER_USERS","gitlabuser@accenture.com","The list of users' email addresses that should be setup initially as viewers. They will have read-only access to all non-admin jobs within the project.")
     }
     label("ldap")
     environmentVariables {
@@ -38,16 +38,34 @@ generateProjectJob.with{
         }
         sshAgent("adop-jenkins-master")
     }
+	scm {
+				git {
+						remote {
+								url('git@gitlab:root/platform-management.git')
+								credentials("adop-jenkins-master")
+						}	
+						branch('*/master')
+				}
+	}
     steps {
         shell('''#!/bin/bash -e
 
-# Validate Variables
-pattern=" |'"
-if [[ "${PROJECT_NAME}" =~ ${pattern} ]]; then
-	echo "PROJECT_NAME contains a space, please replace with an underscore - exiting..."
-	exit 1
-fi''')
+				# Validate Variables
+				pattern=" |'"
+				if [[ "${PROJECT_NAME}" =~ ${pattern} ]]; then
+					echo "PROJECT_NAME contains a space, please replace with an underscore - exiting..."
+					exit 1
+				fi
+		''')
         shell('''set -e
+PASSWORD_GITLAB=${PASSWORD_GITLAB:-gitlab1234}
+
+chmod +x ${WORKSPACE}/common/ldap/*.sh
+chmod +x ${WORKSPACE}/common/ldap/lib/*.sh
+chmod +x ${WORKSPACE}/common/gitlab/*.sh
+chmod +x ${WORKSPACE}/common/gitlab/group/*.sh		
+chmod +x ${WORKSPACE}/projects/gitlab/*.sh	
+
 # LDAP
 ${WORKSPACE}/common/ldap/generate_role.sh -r "admin" -n "${WORKSPACE_NAME}.${PROJECT_NAME}" -d "${DC}" -g "${OU_GROUPS}" -p "${OU_PEOPLE}" -u "${ADMIN_USERS}" -f "${OUTPUT_FILE}" -w "${WORKSPACE}"
 ${WORKSPACE}/common/ldap/generate_role.sh -r "developer" -n "${WORKSPACE_NAME}.${PROJECT_NAME}" -d "${DC}" -g "${OU_GROUPS}" -p "${OU_PEOPLE}" -u "${DEVELOPER_USERS}" -f "${OUTPUT_FILE}" -w "${WORKSPACE}"
@@ -61,30 +79,50 @@ ADMIN_USERS=$(echo ${ADMIN_USERS} | tr ',' ' ')
 DEVELOPER_USERS=$(echo ${DEVELOPER_USERS} | tr ',' ' ')
 VIEWER_USERS=$(echo ${VIEWER_USERS} | tr ',' ' ')
 
-# Gerrit
-for user in $ADMIN_USERS $DEVELOPER_USERS $VIEWER_USERS
+# Gitlab
+token="$(curl -X POST "http://gitlab:9080/api/v3/session?login=root&password=${PASSWORD_GITLAB}" | python -c "import json,sys;obj=json.load(sys.stdin);print obj['private_token'];")"
+				
+# get the namespace id of the group
+gid="$(curl --header "PRIVATE-TOKEN: $token" "http://gitlab:9080/api/v3/groups/${WORKSPACE_NAME}" | python -c "import json,sys;obj=json.load(sys.stdin);print obj['id'];")"
+				
+# create new project				
+${WORKSPACE}/common/gitlab/create_project.sh -g http://gitlab:9080/ -t "${token}" -w "${gid}" -p "${PROJECT_NAME}"
+				
+# get project id
+pid="$(curl --header "PRIVATE-TOKEN: $token" "http://gitlab:9080/api/v3/projects/${WORKSPACE_NAME}%2F${PROJECT_NAME}" | python -c "import json,sys;obj=json.load(sys.stdin);print obj['id'];")"
+				
+# add the users to the project as owners
+for owner in $ADMIN_USERS
 do
-        username=$(echo ${user} | cut -d'@' -f1)
-        ${WORKSPACE}/common/gerrit/create_user.sh -g http://gerrit:8080/gerrit -u "${username}" -p "${username}"
+		ownername=$(echo ${owner} | cut -d'@' -f1)
+		uid="$(curl --header "PRIVATE-TOKEN: $token" "http://gitlab:9080/api/v3/users?username=${ownername}" | python -c "import json,sys;obj=json.load(sys.stdin);print obj[0]['id'];")"
+		${WORKSPACE}/projects/gitlab/add_user_to_project.sh -g http://gitlab:9080/ -t $token -p $pid -u $uid -a 50
+done
+				
+# add the users to the project as developers
+for developer in $DEVELOPER_USERS
+do
+		developername=$(echo ${developer} | cut -d'@' -f1)
+		uid="$(curl --header "PRIVATE-TOKEN: $token" "http://gitlab:9080/api/v3/users?username=${developername}" | python -c "import json,sys;obj=json.load(sys.stdin);print obj[0]['id'];")"
+		${WORKSPACE}/projects/gitlab/add_user_to_project.sh -g http://gitlab:9080/ -t $token -p $pid -u $uid -a 30
+done
+				
+# add the users to the project as guests
+for guest in $VIEWER_USERS
+do
+		guestname=$(echo ${guest} | cut -d'@' -f1)
+		uid="$(curl --header "PRIVATE-TOKEN: $token" "http://gitlab:9080/api/v3/users?username=${guestname}" | python -c "import json,sys;obj=json.load(sys.stdin);print obj[0]['id'];")"
+		${WORKSPACE}/projects/gitlab/add_user_to_project.sh -g http://gitlab:9080/ -t $token -p $pid -u $uid -a 10
 done''')
         shell('''#!/bin/bash -ex
-# Gerrit
-source ${WORKSPACE}/projects/gerrit/configure.sh''')
+				# Gerrit
+				source ${WORKSPACE}/projects/gerrit/configure.sh
+		''')
         dsl {
             external("projects/jobs/**/*.groovy")
         }
         systemGroovyScriptFile('${WORKSPACE}/projects/groovy/acl_admin.groovy')
         systemGroovyScriptFile('${WORKSPACE}/projects/groovy/acl_developer.groovy')
         systemGroovyScriptFile('${WORKSPACE}/projects/groovy/acl_viewer.groovy')
-    }
-    scm {
-        git {
-            remote {
-                name("origin")
-                url("${platformToolsGitURL}")
-                credentials("adop-jenkins-master")
-            }
-            branch("*/master")
-        }
     }
 }
